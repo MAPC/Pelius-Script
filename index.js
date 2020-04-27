@@ -68,7 +68,7 @@ function getNewToken(oAuth2Client, callback) {
 function readAddresses(auth) {
   const sheets = google.sheets({version: 'v4', auth});
   // Options: "Testing Facilities", "Shelters"
-  const sheetToUpdate = 'Shelters'
+  const sheetToUpdate = 'Testing Facilities'
   sheets.spreadsheets.values.get({
     spreadsheetId: '1RYc2Y0wgjzt4liubLk_l631zUeAIz9ilCFHYNsthimU',
     range: `${sheetToUpdate}!A2:E`,
@@ -85,7 +85,10 @@ function readAddresses(auth) {
     }
     let coordinates = [];
     addresses.forEach((row) => {
-      coordinates.push(axios.get(`http://pelias.mapc.org/v1/search?text=${row}`).then((result) => new Promise(resolve => resolve(result.data.features[0].geometry.coordinates))))
+      coordinates.push(axios.get(`http://pelias.mapc.org/v1/search?text=${row}`)
+        .then((result) => new Promise(resolve => resolve(result.data.features[0].geometry.coordinates)))
+        .catch((error) => console.log(error))
+      )
     });
     Promise.all(coordinates).then((res) => {
       const request = {
