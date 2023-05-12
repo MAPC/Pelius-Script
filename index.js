@@ -2,13 +2,18 @@ const fs = require('fs');
 const readline = require('readline');
 const {google} = require('googleapis');
 const axios = require('axios');
+const rateLimit = require('axios-rate-limit');
 
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 const TOKEN_PATH = 'token.json';
 
+
+// Rate-limited axios, so we don't overwhelm Pelias or get rate-limited while working with Google APIs
+const rlaxios = rateLimit(axios.create(), { maxRPS: 30 })
+
 fs.readFile('credentials.json', (err, content) => {
   if (err) return console.log('Error loading client secret file:', err);
-  authorize(JSON.parse(content), readAddresses);
+  authorize(JSON.parse(content), processSheets);
 });
 
 /**
@@ -60,48 +65,102 @@ function getNewToken(oAuth2Client, callback) {
   });
 }
 
-/**
- * Prints the names and majors of students in a sample spreadsheet:
- * @see https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit
- * @param {google.auth.OAuth2} auth The authenticated Google OAuth client.
- */
-function readAddresses(auth) {
+function shouldGeocode(sheet) {
+  if (sheet.disableGeocoding != null && (sheet.disableGeocoding == "Y" || sheet.disableGeocoding == "Yes")) {
+    return false;
+  }
+  return true;
+}
+
+function processSheets(auth) {
   const sheets = google.sheets({version: 'v4', auth});
-  // Options: "Testing Facilities", "Shelters"
-  const sheetToUpdate = 'Testing Facilities'
-  sheets.spreadsheets.values.get({
-    spreadsheetId: '1RYc2Y0wgjzt4liubLk_l631zUeAIz9ilCFHYNsthimU',
-    range: `${sheetToUpdate}!A2:E`,
+  const dataSheet = 'Sheets to Geocode';
+  return sheets.spreadsheets.values.get({
+    spreadsheetId: '1cLwj7JzSo4RMk4mm7o62818aIC2lapqtbJJIWciCi_g',
+    range: `${dataSheet}!A2:H`,
   }, (err, res) => {
     if (err) return console.log('The API returned an error: ' + err);
-    const rows = res.data.values;
-    let addresses = [];
-    if (rows.length) {
-      rows.map((row) => {
-        addresses.push(row[2])
-      });
-    } else {
-      console.log('No data found.');
-    }
+    const targetSheets = res.data.values.map(row => {
+      return {
+        id: row[0].split("/")[5],
+        name: row[1],
+        searchTermColumn: row[2],
+        longColumn: row[3],
+        latColumn: row[4],
+        errorColumn: row[5],
+        lastGeocodedAt: row[6],
+        disableGeocoding: row[7]
+      }
+    });
+    targetSheets.forEach(sheet => {
+      if (shouldGeocode(sheet)) {
+        readAddresses(auth, sheet);
+      }
+    });
+  })
+}
+
+function readAddresses(auth, sheet) {
+  const sheets = google.sheets({version: 'v4', auth});
+
+  sheets.spreadsheets.values.get({
+    spreadsheetId: sheet.id,
+    range: `${sheet.name}!${sheet.searchTermColumn}2:${sheet.searchTermColumn}`,
+  }, (err, res) => {
+    if (err) return console.log('The API returned an error: ' + err);
+    const addresses = res.data.values;
     let coordinates = [];
     addresses.forEach((row) => {
-      coordinates.push(axios.get(`http://pelias.mapc.org/v1/search?text=${row}`)
-        .then((result) => new Promise(resolve => resolve(result.data.features[0].geometry.coordinates)))
+      // TODO: Update this code to use bounding boxes from whosonfirst to get better Pelias results
+      /*
+      const boundary = {
+        rect: {
+          min_lon: -70.467605,
+          min_lat: 41.586336,
+          max_lon: -70.25964,
+          max_lat: 41.740088
+        }
+      }
+      */
+      // const full_url = `https://pelias.mapc.org/v1/search?text=${addresses[i]}&boundary.rect.min_lat=${boundary.rect.min_lat}&boundary.rect.min_lon=${boundary.rect.min_lon}&boundary.rect.max_lat=${boundary.rect.max_lat}&boundary.rect.max_lon=${boundary.rect.max_lon}`;
+      const full_url = `https://pelias.mapc.org/v1/search?text=${row}`;
+      coordinates.push(rlaxios.get(full_url)
+        .then((result) => new Promise(resolve => {
+          if (result.data.features.length > 0) {
+            return resolve(result.data.features[0].geometry.coordinates);
+          } else {
+            return resolve(["Error", "Error"]);
+          }
+          }))
         .catch((error) => console.log(error))
       )
     });
+
     Promise.all(coordinates).then((res) => {
+      res = res.map(x => x == null? [null, null] : x);
       const request = {
-        spreadsheetId: '1RYc2Y0wgjzt4liubLk_l631zUeAIz9ilCFHYNsthimU',
-        range: `${sheetToUpdate}!E2:F`,
+        spreadsheetId: sheet.id,
+        range: `${sheet.name}!${sheet.longColumn}2:${sheet.latColumn}`,
         valueInputOption: 'RAW',
         resource: { values: res },
         auth: auth,
       };
 
       try {
-        (sheets.spreadsheets.values.update(request)).data;
-        console.log("Success");
+        sheets.spreadsheets.values.update(request).then(response => {
+          console.log("Updated sheet with geocoder results");
+          const now = new Date();
+          const timestampRequest = {
+            spreadsheetId: '1cLwj7JzSo4RMk4mm7o62818aIC2lapqtbJJIWciCi_g',
+            range: `Sheets to Geocode!G2:G`,
+            valueInputOption: 'RAW',
+            resource: { values: [[now.toISOString()]] },
+            auth: auth,
+          };
+          sheets.spreadsheets.values.update(timestampRequest);
+        }, reason => {
+          console.error('error: ', reason.result.error.message);
+        });
       } catch (err) {
         console.error(err);
       }
